@@ -92,33 +92,40 @@ def is_dex_paid(chain_id, token_address):
             return True, order
     return False, None
 
-# Function to get token pairs
+# Function to get token pairs with required data
 def get_token_pairs(chain_id, token_address):
     url = f"{DEXSCREENER_API_BASE_URL}/token-pairs/v1/{chain_id}/{token_address}"
     data = retry_request(url)
-    
+
     if not data:
         print(f"No data received for {token_address}")
         return []
-    
+
     if isinstance(data, list):
-        data = data[0]
-    
+        data = data[0]  # Extract the first element if it's a list
+
     if not isinstance(data, dict):
         print(f"Unexpected API response format for {token_address}: {data}")
         return []
-    
+
     pairs = data.get("pairs", [])
+
     if isinstance(pairs, list) and pairs:
         for pair in pairs:
             pair["volume24h"] = pair.get("volume", {}).get("h24", 0)
             pair["liquidity"] = pair.get("liquidity", {}).get("usd", "Unknown")
             pair["buyers"] = pair.get("txns", {}).get("h24", {}).get("buys", 0)
             pair["sellers"] = pair.get("txns", {}).get("h24", {}).get("sells", 0)
+            pair["holders"] = pair.get("holders", {}).get("total", 0)  # Extract total holders if available
+
+            # Convert "socials" field to a boolean
+            pair["has_socials"] = bool(pair.get("info", {}).get("socials"))
+
         return pairs
-    
+
     print(f"No pairs found for {token_address}")
     return []
+
 
 # Function to save token data to PostgreSQL
 def save_token_data(token_data):
@@ -219,6 +226,9 @@ def inspect_token_profiles(token_profiles):
                 
                 token_name = pair_data.get("baseToken", {}).get("name")
                 market_cap = pair_data.get("marketCap", 0)
+                holders = pair_data.get("holders", 0)
+                volume_24h = pair_data.get("volume24h", 0)
+                has_socials = pair_data.get("has_socials", False)
 
                 # Initialize first recorded market cap and all-time high market cap
                 first_recorded_market_cap = market_cap
@@ -239,11 +249,13 @@ def inspect_token_profiles(token_profiles):
 
                     # Save token data (with first MC and ATH)
                     cursor.execute("""
-                        INSERT INTO tokens (token_name, symbol, market_cap, first_recorded_market_cap, all_time_high, pair_created_at, dex_paid_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO tokens (token_name, symbol, market_cap, first_recorded_market_cap, all_time_high, pair_created_at, dex_paid_at, holders, volume_24h, has_socials)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (token_name) DO UPDATE
                         SET market_cap = EXCLUDED.market_cap,
-                            all_time_high = GREATEST(tokens.all_time_high, EXCLUDED.market_cap)
+                            all_time_high = GREATEST(tokens.all_time_high, EXCLUDED.market_cap),
+                            holders = EXCLUDED.holders,
+                            volume_24h = EXCLUDED.volume_24h
                     """, (
                         token_name,
                         pair_data.get("baseToken", {}).get("symbol"),
@@ -251,12 +263,15 @@ def inspect_token_profiles(token_profiles):
                         first_recorded_market_cap,
                         all_time_high,
                         pair_created_at,
-                        dex_paid_at
+                        dex_paid_at,
+                        holders,
+                        volume_24h,
+                        has_socials
                     ))
 
                     conn.commit()
                 except Exception as e:
-                    print(f"❌ ERROR: Failed to log token data for {token_name} - {e}")
+                    print(f"ERROR: Failed to log token data for {token_name} - {e}")
                 finally:
                     conn.close()
 
@@ -265,7 +280,6 @@ def inspect_token_profiles(token_profiles):
                 
                 dex_paid_sniped += 1
                 latest_dex_paid_time = datetime.now()
-
 
 # Main execution loop
 def main():
