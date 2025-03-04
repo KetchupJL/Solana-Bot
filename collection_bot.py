@@ -1,5 +1,6 @@
 import requests
 import csv
+import psycopg2
 from datetime import datetime, timezone, timedelta
 import time
 import threading
@@ -14,6 +15,14 @@ DATA_FILE = "dex_paid_tracked_data.csv"
 PRICE_TRACK_FILE = "price_tracking_data.csv"
 DEXSCREENER_API_BASE_URL = "https://api.dexscreener.com"
 TARGET_CHAIN_ID = "solana"
+MAX_MARKET_CAP = 100000  # Filter for tokens under 100K MC
+
+# PostgreSQL Database Credentials
+DB_NAME = "solana_bot"
+DB_USER = "bot_user"
+DB_PASSWORD = "Topdog"
+DB_HOST = "localhost"
+DB_PORT = "5432"
 
 # Globals
 already_paid_dex_tokens = TTLCache(maxsize=500000, ttl=3600)
@@ -21,7 +30,41 @@ tokens_scanned = 0
 dex_paid_sniped = 0
 latest_dex_paid_time = None
 
-# Retry logic to handle API failures
+# Initialize PostgreSQL Database
+def init_db():
+    conn = psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
+    )
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tokens (
+            id SERIAL PRIMARY KEY,
+            token_name TEXT,
+            symbol TEXT,
+            market_cap INTEGER,
+            pair_created_at TIMESTAMP,
+            dex_paid_at TIMESTAMP,
+            logged_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS prices (
+            id SERIAL PRIMARY KEY,
+            token_name TEXT,
+            token_address TEXT,
+            timestamp TIMESTAMP,
+            price_usd REAL
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Retry logic for API requests
 def retry_request(url, retries=3, delay=5):
     for attempt in range(retries):
         try:
@@ -31,14 +74,14 @@ def retry_request(url, retries=3, delay=5):
         except requests.RequestException as e:
             print(f"Error fetching data ({attempt+1}/{retries}): {e}")
             time.sleep(delay)
-    return None  # Return None if all retries fail
+    return None
 
-# Function to fetch the latest token profiles
+# Function to get latest token profiles
 def get_latest_token_profiles():
     url = f"{DEXSCREENER_API_BASE_URL}/token-profiles/latest/v1"
     return retry_request(url)
 
-# Function to check if a token has paid for promotions
+# Function to check if a token has paid for Dex Screener
 def is_dex_paid(chain_id, token_address):
     url = f"{DEXSCREENER_API_BASE_URL}/orders/v1/{chain_id}/{token_address}"
     orders = retry_request(url)
@@ -49,65 +92,95 @@ def is_dex_paid(chain_id, token_address):
             return True, order
     return False, None
 
-# Function to get token pairs data
+# Function to get token pairs
 def get_token_pairs(chain_id, token_address):
     url = f"{DEXSCREENER_API_BASE_URL}/token-pairs/v1/{chain_id}/{token_address}"
     data = retry_request(url)
+    
     if not data:
+        print(f"No data received for {token_address}")
         return []
+    
+    if isinstance(data, list):
+        data = data[0]
+    
+    if not isinstance(data, dict):
+        print(f"Unexpected API response format for {token_address}: {data}")
+        return []
+    
     pairs = data.get("pairs", [])
-    for pair in pairs:
-        pair["volume24h"] = pair.get("volume", {}).get("h24")  # 24-hour volume
-        pair["liquidity"] = pair.get("liquidity", "Unknown")  # Liquidity pool size
-        pair["buyers"] = pair.get("txns", {}).get("h24", {}).get("buys", 0)
-        pair["sellers"] = pair.get("txns", {}).get("h24", {}).get("sells", 0)
-    return pairs
+    if isinstance(pairs, list) and pairs:
+        for pair in pairs:
+            pair["volume24h"] = pair.get("volume", {}).get("h24", 0)
+            pair["liquidity"] = pair.get("liquidity", {}).get("usd", "Unknown")
+            pair["buyers"] = pair.get("txns", {}).get("h24", {}).get("buys", 0)
+            pair["sellers"] = pair.get("txns", {}).get("h24", {}).get("sells", 0)
+        return pairs
+    
+    print(f"No pairs found for {token_address}")
+    return []
 
-# Function to prevent duplicate token entries and save token data
+# Function to save token data to PostgreSQL
 def save_token_data(token_data):
-    try:
-        existing_data = pd.read_csv(DATA_FILE)
-        if token_data.get("tokenName") in existing_data["Token Name"].values:
-            print(f"Skipping {token_data.get('tokenName')} - already logged.")
-            return
-    except FileNotFoundError:
-        pass  # If file doesn’t exist, continue
+    """Inserts token data into the PostgreSQL database while avoiding duplicates."""
+    if token_data.get("marketCap", 0) > MAX_MARKET_CAP:
+        print(f"Skipping {token_data.get('tokenName')} - Market Cap exceeds 100K")
+        return
 
-    with open(DATA_FILE, "a", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            token_data.get("tokenName"), token_data.get("tokenSymbol"),
-            token_data.get("marketCap", 0),
-            token_data.get("pairCreatedAt"), token_data.get("dexPaidAt"),
-            datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-        ])
+    conn = psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
+    )
+    cursor = conn.cursor()
+
+    # Check if token is already in the database
+    cursor.execute("SELECT token_name FROM tokens WHERE token_name = %s", (token_data.get("tokenName"),))
+    if cursor.fetchone():
+        print(f"Skipping {token_data.get('tokenName')} - already logged.")
+        conn.close()
+        return
+
+    # Insert new token data
+    cursor.execute("""
+        INSERT INTO tokens (token_name, symbol, market_cap, pair_created_at, dex_paid_at)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        token_data.get("tokenName"),
+        token_data.get("tokenSymbol"),
+        token_data.get("marketCap", 0),
+        token_data.get("pairCreatedAt"),
+        token_data.get("dexPaidAt")
+    ))
+
+    conn.commit()
+    conn.close()
+    print(f"Saved token: {token_data.get('tokenName')}")
+
 
 # Function to track price changes every 1 minute for 6 hours
 def track_price_changes(token_address, token_name, duration=6, interval=1):
-    headers = ["Token Name", "Token Address", "Timestamp", "Price USD"]
-    file_exists = False
-    try:
-        with open(PRICE_TRACK_FILE, "r") as f:
-            file_exists = True
-    except FileNotFoundError:
-        pass
+    """Tracks price changes for a given token and logs them into the PostgreSQL database."""
+    conn = psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
+    )
+    cursor = conn.cursor()
 
-    total_checks = (duration * 60) // interval  # Convert hours to minute intervals
+    total_checks = (duration * 60) // interval  # Convert hours to minutes
     for _ in range(total_checks):
         pairs = get_token_pairs(TARGET_CHAIN_ID, token_address)
-        price_usd = pairs[0].get("priceUsd") if pairs else "Unknown"
-        timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+        price_usd = pairs[0].get("priceUsd") if pairs else None
+        timestamp = datetime.utcnow()
 
-        with open(PRICE_TRACK_FILE, "a", newline="") as file:
-            writer = csv.writer(file)
-            if not file_exists:
-                writer.writerow(headers)
-                file_exists = True
-            writer.writerow([token_name, token_address, timestamp, price_usd])
+        cursor.execute("""
+            INSERT INTO prices (token_name, token_address, timestamp, price_usd)
+            VALUES (%s, %s, %s, %s)
+        """, (token_name, token_address, timestamp, price_usd))
 
+        conn.commit()
         time.sleep(interval * 60)  # Wait before next check
 
-# Function to inspect token profiles and process them
+    conn.close()
+
+# Function to inspect token profiles and check if they are Dex Paid
 def inspect_token_profiles(token_profiles):
     global tokens_scanned, dex_paid_sniped, latest_dex_paid_time
     for profile in token_profiles:
@@ -123,15 +196,27 @@ def inspect_token_profiles(token_profiles):
                 pairs = get_token_pairs(chain_id, token_address)
                 if not pairs:
                     continue
-                pair_data = pairs[0]  # Assuming the first pair is the primary one
+                pair_data = pairs[0]
                 token_data = {
                     "tokenName": pair_data.get("baseToken", {}).get("name"),
                     "tokenSymbol": pair_data.get("baseToken", {}).get("symbol"),
                     "marketCap": pair_data.get("marketCap"),
-                    "pairCreatedAt": pair_data.get("pairCreatedAt"),
-                    "dexPaidAt": dex_paid_details.get("paymentTimestamp")
+                    "pairCreatedAt": datetime.utcfromtimestamp(int(pair_data.get("pairCreatedAt", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if pair_data.get("pairCreatedAt") else None,
+                    "dexPaidAt": datetime.utcfromtimestamp(int(dex_paid_details.get("paymentTimestamp", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if dex_paid_details and dex_paid_details.get("paymentTimestamp") else None
                 }
                 save_token_data(token_data)
                 threading.Thread(target=track_price_changes, args=(token_address, token_data["tokenName"]), daemon=True).start()
                 dex_paid_sniped += 1
                 latest_dex_paid_time = datetime.now()
+
+# Main execution loop
+def main():
+    print("Dex Paid Token Bot Started...")
+    while True:
+        token_profiles = get_latest_token_profiles()
+        if token_profiles:
+            inspect_token_profiles(token_profiles)
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
