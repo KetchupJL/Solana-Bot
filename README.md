@@ -32,3 +32,6 @@ Big one, is the initial "DEX PAID MARKET CAP", actually this? Or is it just firs
 
 
 check that the bot is tracking changes through the right api end points (speed things up), searching for token-- i dont think this i soptimised. A lot of time a requests wasted. I think we could use a separate bot to track changes?? Uses CA from data base to track changes. Only tracks coins for up to 2-3 hours after dec is paid
+
+
+Need to add a filter for minimum MC
