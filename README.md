@@ -35,3 +35,5 @@ check that the bot is tracking changes through the right api end points (speed t
 
 
 Need to add a filter for minimum MC
+
+The bots output is only useful for a few minutes before it stops producing good output (just checks tokens, just isnt updating saved ones, nor detecting new ones). Needs looking into.
