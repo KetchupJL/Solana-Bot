@@ -7,6 +7,9 @@ import threading
 from cachetools import TTLCache
 import pandas as pd
 from typing import Optional
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
 
 # Constants
 PERIOD = 60
@@ -30,25 +33,28 @@ tokens_scanned = 0
 dex_paid_sniped = 0
 latest_dex_paid_time = None
 
-# Initialize PostgreSQL Database
 def init_db():
     conn = psycopg2.connect(
         dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
     )
     cursor = conn.cursor()
-    
+
+    # Create the tokens table with ATH tracking
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tokens (
             id SERIAL PRIMARY KEY,
             token_name TEXT,
             symbol TEXT,
-            market_cap INTEGER,
+            market_cap_at_dex_paid INTEGER,
+            highest_market_cap INTEGER,
             pair_created_at TIMESTAMP,
             dex_paid_at TIMESTAMP,
+            ath_timestamp TIMESTAMP,
             logged_at TIMESTAMP DEFAULT NOW()
         )
     """)
-    
+
+    # Create the price tracking table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS prices (
             id SERIAL PRIMARY KEY,
@@ -58,128 +64,161 @@ def init_db():
             price_usd REAL
         )
     """)
-    
+
     conn.commit()
     conn.close()
-
 init_db()
 
-# Retry logic for API requests
-def retry_request(url, retries=3, delay=5):
-    for attempt in range(retries):
+
+def retry_request(url, max_retries=3, delay=2):
+    """
+    Handles retries for API requests in case of temporary failures.
+    """
+    for attempt in range(max_retries):
         try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"Error fetching data ({attempt+1}/{retries}): {e}")
-            time.sleep(delay)
-    return None
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"⚠️ API Error {response.status_code}: {response.text}")
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Request failed (Attempt {attempt+1}/{max_retries}): {e}")
+        time.sleep(delay)
+    return None  # Return None if all retries fail
+
 
 # Function to get latest token profiles
 def get_latest_token_profiles():
     url = f"{DEXSCREENER_API_BASE_URL}/token-profiles/latest/v1"
     return retry_request(url)
 
-# Function to check if a token has paid for Dex Screener
 def is_dex_paid(chain_id, token_address):
     url = f"{DEXSCREENER_API_BASE_URL}/orders/v1/{chain_id}/{token_address}"
     orders = retry_request(url)
-    if not orders:
+
+    if not orders or not isinstance(orders, list):  # ✅ Ensures it's a list
         return False, None
+
     for order in orders:
-        if order.get("type") == "tokenProfile" and order.get("status") == "approved":
-            return True, order
+        if isinstance(order, dict):  # ✅ Ensures each order is a dictionary
+            if order.get("type") == "tokenProfile" and order.get("status") == "approved":
+                return True, order
+
     return False, None
 
-# Function to get token pairs with required data
 def get_token_pairs(chain_id, token_address):
+    """
+    Fetches available trading pairs for a given token on a specific blockchain.
+    """
     url = f"{DEXSCREENER_API_BASE_URL}/token-pairs/v1/{chain_id}/{token_address}"
     data = retry_request(url)
 
     if not data:
-        print(f"No data received for {token_address}")
+        print(f"❌ No data received for {token_address}")
         return []
 
+    # ✅ Fix: API returns a list, so we extract pairs from each item
+    pairs = []
     if isinstance(data, list):
-        data = data[0]  # Extract the first element if it's a list
+        for item in data:
+            if isinstance(item, dict) and "marketCap" in item:  # Ensure it's a valid dictionary with marketCap
+                pairs.append(item)
 
-    if not isinstance(data, dict):
-        print(f"Unexpected API response format for {token_address}: {data}")
-        return []
-
-    pairs = data.get("pairs", [])
-
-    if isinstance(pairs, list) and pairs:
-        for pair in pairs:
-            pair["volume24h"] = pair.get("volume", {}).get("h24", 0)
-            pair["liquidity"] = pair.get("liquidity", {}).get("usd", "Unknown")
-            pair["buyers"] = pair.get("txns", {}).get("h24", {}).get("buys", 0)
-            pair["sellers"] = pair.get("txns", {}).get("h24", {}).get("sells", 0)
-            pair["holders"] = pair.get("holders", {}).get("total", 0)  # Extract total holders if available
-
-            # Convert "socials" field to a boolean
-            pair["has_socials"] = bool(pair.get("info", {}).get("socials"))
-
+    if pairs:
+        print(f"✅ Found {len(pairs)} pairs for {token_address}: {pairs}")
         return pairs
 
-    print(f"No pairs found for {token_address}")
+    print(f"⚠️ No pairs found for {token_address} (API returned empty or unexpected format)")
     return []
 
 
-# Function to save token data to PostgreSQL
-def save_token_data(token_data):
-    """Inserts token data into the PostgreSQL database while avoiding duplicates."""
-    print(f"DEBUG: Attempting to save token: {token_data}")  # ADD DEBUG
 
-    if token_data.get("marketCap", 0) > MAX_MARKET_CAP:
-        print(f"Skipping {token_data.get('tokenName')} - Market Cap exceeds 100K")
-        return  # Exit function early
+
+def save_token_data(token_data):
+    print(f" DEBUG: Attempting to save token: {token_data}")
 
     try:
-        # Establish DB connection
         conn = psycopg2.connect(
             dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
         )
         cursor = conn.cursor()
 
-        # Check if token is already in the database
-        cursor.execute("SELECT token_name FROM tokens WHERE token_name = %s", (token_data.get("tokenName"),))
-        if cursor.fetchone():
-            print(f"Skipping {token_data.get('tokenName')} - already logged.")
-            return  # Exit early
+        # Debugging: Check if DB connection works
+        print(" Connected to the database")
 
-        # Insert new token data
+        # Check if the token exists in DB
+        cursor.execute("SELECT market_cap_at_dex_paid, highest_market_cap, ath_timestamp FROM tokens WHERE contract_address = %s", 
+                       (token_data.get("contractAddress"),))
+        existing_token = cursor.fetchone()
+
+        market_cap = token_data.get("marketCap", 0)
+        if not isinstance(market_cap, (int, float)):  # Ensure it's a valid number
+            market_cap = 0
+
+        if existing_token:
+            # Extract existing data
+            market_cap_at_dex_paid, highest_market_cap, existing_ath_timestamp = existing_token
+
+            # ✅ Ensure `market_cap_at_dex_paid` is NEVER updated after insertion.
+            if market_cap > highest_market_cap:
+                new_ath_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                print(f"📈 Updating {token_data.get('tokenName')} - New ATH: {market_cap} at {new_ath_time}")
+
+                cursor.execute("""
+                    UPDATE tokens 
+                    SET highest_market_cap = %s, ath_timestamp = %s 
+                    WHERE contract_address = %s
+                """, (market_cap, new_ath_time, token_data.get("contractAddress")))
+
+                conn.commit()
+                print(f"✅ ATH Updated for {token_data.get('tokenName')}: {market_cap} at {new_ath_time}")
+
+            else:
+                print(f" Skipping {token_data.get('tokenName')} - No new highest market cap.")
+
+            return  # Exit function if token already exists
+
+        # If the token is new, insert it
+        print(f" Inserting {token_data.get('tokenName')} into DB...")
+
         cursor.execute("""
-            INSERT INTO tokens (token_name, symbol, market_cap, pair_created_at, dex_paid_at)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO tokens (token_name, symbol, contract_address, market_cap_at_dex_paid, highest_market_cap, pair_created_at, dex_paid_at, ath_timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             token_data.get("tokenName"),
             token_data.get("tokenSymbol"),
-            token_data.get("marketCap", 0),
+            token_data.get("contractAddress"),
+            market_cap,  # ✅ Market Cap at DEX Paid time is stored permanently
+            market_cap,  # ✅ Start `highest_market_cap` at `market_cap` initially
             token_data.get("pairCreatedAt"),
-            token_data.get("dexPaidAt")
+            token_data.get("dexPaidAt"),
+            datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')  # ✅ Set ATH timestamp initially
         ))
 
         conn.commit()
-        print(f"DEBUG: Successfully saved {token_data.get('tokenName')}")  # Confirm success
+        print(f" ✅ Successfully saved {token_data.get('tokenName')} to the database.")
 
     except Exception as e:
-        print(f"ERROR: Failed to save token - {e}")  # Print SQL errors
+        print(f" ❌ ERROR: Failed to save token to DB - {e}")
 
     finally:
-        cursor.close()  # Ensure cursor is closed
-        conn.close()  # Ensure connection is closed
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
-# Function to track price changes every 1 minute for 6 hours
 def track_price_changes(token_address, token_name, duration=6, interval=1):
     headers = ["Token Name", "Token Address", "Timestamp", "Price USD"]
     
     total_checks = (duration * 60) // interval  # Convert hours to minute intervals
+
     for _ in range(total_checks):
         pairs = get_token_pairs(TARGET_CHAIN_ID, token_address)
         price_usd = pairs[0].get("priceUsd") if pairs else "Unknown"
-        timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        conn = None
+        cursor = None
 
         try:
             conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
@@ -191,95 +230,122 @@ def track_price_changes(token_address, token_name, duration=6, interval=1):
             """, (token_name, token_address, timestamp, price_usd))
 
             conn.commit()
+
         except Exception as e:
-            print(f"❌ ERROR: Failed to track price for {token_name} - {e}")
+            print(f"ERROR: Failed to track price for {token_name} - {e}")
+
         finally:
-            conn.close()
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()  # Ensure connection is closed
 
         time.sleep(interval * 60)  # Wait before next check
 
+def track_ath_market_cap():
+    """
+    Continuously checks all saved tokens for new All-Time Highs (ATH).
+    Runs every 20 seconds for a few hours.
+    """
+    while True:
+        try:
+            conn = psycopg2.connect(
+                dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
+            )
+            cursor = conn.cursor()
 
-# Function to inspect token profiles and check if they are Dex Paid
+            # Fetch all tokens from the database
+            cursor.execute("SELECT contract_address, highest_market_cap FROM tokens")
+            tokens = cursor.fetchall()
+
+            for contract_address, highest_market_cap in tokens:
+                # Get current market cap from API
+                pairs = get_token_pairs(TARGET_CHAIN_ID, contract_address)
+                if not pairs:
+                    continue  # Skip if no data found
+                
+                current_market_cap = float(pairs[0].get("marketCap", 0))
+
+                if current_market_cap > highest_market_cap:
+                    new_ath_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                    print(f"📈 New ATH for {contract_address}: {current_market_cap} at {new_ath_time}")
+
+                    # Update database with new ATH
+                    cursor.execute("""
+                        UPDATE tokens 
+                        SET highest_market_cap = %s, ath_timestamp = %s 
+                        WHERE contract_address = %s
+                    """, (current_market_cap, new_ath_time, contract_address))
+
+                    conn.commit()
+
+            cursor.close()
+            conn.close()
+
+        except Exception as e:
+            print(f"❌ ERROR: Failed to track ATH market cap - {e}")
+
+        time.sleep(20)  # Wait 20 seconds before checking again
+
+
 def inspect_token_profiles(token_profiles):
     global tokens_scanned, dex_paid_sniped, latest_dex_paid_time
-    
+
     for profile in token_profiles:
         tokens_scanned += 1
         token_address = profile.get("tokenAddress")
         chain_id = profile.get("chainId")
 
         if not token_address or not chain_id or chain_id != TARGET_CHAIN_ID:
+            print(f"DEBUG: Skipping {token_address} (Invalid Chain or Missing Address)")
             continue
-        elif token_address not in already_paid_dex_tokens:
+
+        print(f"DEBUG: Checking {token_address} on {chain_id}")  # ADDED
+
+        if token_address not in already_paid_dex_tokens:
             paid, dex_paid_details = is_dex_paid(chain_id, token_address)
+        else:
+            paid, dex_paid_details = False, None  # Ensure paid is always defined
 
-            if paid:
-                already_paid_dex_tokens[token_address] = datetime.now()
-                pairs = get_token_pairs(chain_id, token_address)
-                if not pairs:
-                    continue
-                pair_data = pairs[0]
+        if paid:
+            print(f"  {token_address} is DEX PAID!")
 
-                # Convert timestamps to readable format
-                pair_created_at = datetime.utcfromtimestamp(int(pair_data.get("pairCreatedAt", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if pair_data.get("pairCreatedAt") else None
-                dex_paid_at = datetime.utcfromtimestamp(int(dex_paid_details.get("paymentTimestamp", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if dex_paid_details and dex_paid_details.get("paymentTimestamp") else None
-                
-                token_name = pair_data.get("baseToken", {}).get("name")
-                market_cap = pair_data.get("marketCap", 0)
-                holders = pair_data.get("holders", 0)
-                volume_24h = pair_data.get("volume24h", 0)
-                has_socials = pair_data.get("has_socials", False)
+            # Add token to the cache
+            already_paid_dex_tokens[token_address] = datetime.now()
 
-                # Initialize first recorded market cap and all-time high market cap
-                first_recorded_market_cap = market_cap
-                all_time_high = market_cap
+            # ⏳ Small delay to allow pairs to appear
+            time.sleep(3)  # Wait 3 seconds
 
-                # Check if the token already exists in the database
-                try:
-                    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
-                    cursor = conn.cursor()
+            pairs = get_token_pairs(chain_id, token_address)
+            if not pairs:
+                print(f"  No pairs found for {token_address}, skipping database save.")
+                continue  # ✅ Use continue instead of return
 
-                    cursor.execute("SELECT market_cap, all_time_high FROM tokens WHERE token_name = %s", (token_name,))
-                    result = cursor.fetchone()
-                    
-                    if result:
-                        first_recorded_market_cap = result[0]  # Keep first recorded market cap unchanged
-                        previous_ath = result[1] or 0  # Fetch previous ATH
-                        all_time_high = max(market_cap, previous_ath)  # Update ATH if necessary
+            pair_data = pairs[0]  # ✅ Correctly placed outside if block
 
-                    # Save token data (with first MC and ATH)
-                    cursor.execute("""
-                        INSERT INTO tokens (token_name, symbol, market_cap, first_recorded_market_cap, all_time_high, pair_created_at, dex_paid_at, holders, volume_24h, has_socials)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (token_name) DO UPDATE
-                        SET market_cap = EXCLUDED.market_cap,
-                            all_time_high = GREATEST(tokens.all_time_high, EXCLUDED.market_cap),
-                            holders = EXCLUDED.holders,
-                            volume_24h = EXCLUDED.volume_24h
-                    """, (
-                        token_name,
-                        pair_data.get("baseToken", {}).get("symbol"),
-                        market_cap,
-                        first_recorded_market_cap,
-                        all_time_high,
-                        pair_created_at,
-                        dex_paid_at,
-                        holders,
-                        volume_24h,
-                        has_socials
-                    ))
+            # Convert timestamps
+            pair_created_at = datetime.fromtimestamp(int(pair_data.get("pairCreatedAt", 0)) / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if pair_data.get("pairCreatedAt") else None
+            dex_paid_at = datetime.fromtimestamp(int(dex_paid_details.get("paymentTimestamp", 0)) / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if dex_paid_details and dex_paid_details.get("paymentTimestamp") else None
+            
+            token_name = pair_data.get("baseToken", {}).get("name")
+            market_cap = pair_data.get("marketCap", 0)
 
-                    conn.commit()
-                except Exception as e:
-                    print(f"ERROR: Failed to log token data for {token_name} - {e}")
-                finally:
-                    conn.close()
 
-                # Start price tracking thread
-                threading.Thread(target=track_price_changes, args=(token_address, token_name), daemon=True).start()
-                
-                dex_paid_sniped += 1
-                latest_dex_paid_time = datetime.now()
+            print(f"DEBUG: Calling save_token_data() for {token_name}")
+            save_token_data({
+                "tokenName": token_name,
+                "tokenSymbol": pair_data.get("baseToken", {}).get("symbol"),
+                "contractAddress": pair_data.get("baseToken", {}).get("address"),
+                "marketCap": market_cap,
+                "pairCreatedAt": pair_created_at,
+                "dexPaidAt": dex_paid_at
+            })
+
+            threading.Thread(target=track_price_changes, args=(token_address, token_name), daemon=True).start()
+            
+            dex_paid_sniped += 1
+            latest_dex_paid_time = datetime.now()
+
 
 # Main execution loop
 def main():
@@ -291,4 +357,10 @@ def main():
         time.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    # Start ATH tracking in a separate thread
+    ath_thread = threading.Thread(target=track_ath_market_cap, daemon=True)
+    ath_thread.start()
+
+    # Start the main bot logic here
+    print("🚀 Bot is starting...")
+    main()  # Replace with your bot's main function
