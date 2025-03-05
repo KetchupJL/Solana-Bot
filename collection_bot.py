@@ -125,13 +125,11 @@ def get_token_pairs(chain_id, token_address):
                 pairs.append(item)
 
     if pairs:
-        print(f"✅ Found {len(pairs)} pairs for {token_address}: {pairs}")
+        print(f"✅ Found ")
         return pairs
 
     print(f"⚠️ No pairs found for {token_address} (API returned empty or unexpected format)")
     return []
-
-
 
 
 def save_token_data(token_data):
