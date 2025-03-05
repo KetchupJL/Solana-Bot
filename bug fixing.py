@@ -73,83 +73,94 @@ def retry_request(url, retries=3, delay=5):
         try:
             response = requests.get(url, timeout=10)
             response.raise_for_status()
+            
+            # ✅ Detect Rate Limit
+            if response.status_code == 429:
+                print("⚠️ Rate limit hit. Waiting before retrying...")
+                time.sleep(delay * (attempt + 1))  # Exponential backoff
+                continue
+            
             return response.json()
+
         except requests.RequestException as e:
-            print(f"Error fetching data ({attempt+1}/{retries}): {e}")
+            print(f"❌ Error fetching data ({attempt+1}/{retries}): {e}")
             time.sleep(delay)
+
     return None
+
 
 # Function to get latest token profiles
 def get_latest_token_profiles():
     url = f"{DEXSCREENER_API_BASE_URL}/token-profiles/latest/v1"
     return retry_request(url)
 
-# Function to check if a token has paid for Dex Screener
 def is_dex_paid(chain_id, token_address):
     url = f"{DEXSCREENER_API_BASE_URL}/orders/v1/{chain_id}/{token_address}"
     orders = retry_request(url)
-    if not orders:
+
+    if not orders or not isinstance(orders, list):  # ✅ Ensures it's a list
         return False, None
+
     for order in orders:
-        if order.get("type") == "tokenProfile" and order.get("status") == "approved":
-            return True, order
+        if isinstance(order, dict):  # ✅ Ensures each order is a dictionary
+            if order.get("type") == "tokenProfile" and order.get("status") == "approved":
+                return True, order
+
     return False, None
+
 
 def get_token_pairs(chain_id, token_address):
     url = f"{DEXSCREENER_API_BASE_URL}/token-pairs/v1/{chain_id}/{token_address}"
     data = retry_request(url)
 
     if not data:
-        print(f"No data received for {token_address}")
+        print(f"❌ No data received for {token_address}")
         return []
 
-    # ✅ Ensure data is properly formatted (Handles case where response is a list)
+    # ✅ Fix: API returns a list, so we extract pairs from each item
+    pairs = []
     if isinstance(data, list):
         for item in data:
-            if isinstance(item, dict) and "pairs" in item:
-                pairs = item.get("pairs", [])
-                if pairs:
-                    print(f" Found pairs for {token_address}: {pairs}")  # Debugging log
-                    return pairs  #  FIXED: Return pairs if found
-        print(f"No pairs found for {token_address}")
-        return []
+            if isinstance(item, dict):  # Ensure it's a valid dictionary
+                pairs.append(item)
 
-    elif isinstance(data, dict) and "pairs" in data:
-        pairs = data.get("pairs", [])
-        if pairs:
-            print(f" Found pairs for {token_address}: {pairs}")
-            return pairs
+    if pairs:
+        print(f"✅ Found pairs for {token_address}: {pairs}")
+        return pairs
 
-    print(f"No pairs found for {token_address}")
+    print(f"⚠️ No pairs found for {token_address} (API returned empty or unexpected format)")
     return []
 
 
 
+
 def save_token_data(token_data):
-    """Inserts token data into the PostgreSQL database while avoiding duplicates."""
-    print(f"DEBUG: Attempting to save token: {token_data}")  # ADD DEBUG
+    print(f" DEBUG: Attempting to save token: {token_data}")
 
     if token_data.get("marketCap", 0) > MAX_MARKET_CAP:
-        print(f"Skipping {token_data.get('tokenName')} - Market Cap exceeds 100K")
-        return  # Exit function early
-
-    conn = None  # Declare connection outside try block
-    cursor = None
+        print(f" Skipping {token_data.get('tokenName')} - Market Cap exceeds 100K")
+        return
 
     try:
-        # Establish DB connection
         conn = psycopg2.connect(
             dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
         )
         cursor = conn.cursor()
 
-        # Check if token is already in the database
-        cursor.execute("SELECT token_name FROM tokens WHERE token_name = %s", (token_data.get("tokenName"),))
-        if cursor.fetchone():
-            print(f"Skipping {token_data.get('tokenName')} - already logged.")
-            return  # Exit early
+        # Debugging: Check if DB connection works
+        print(" Connected to the database")
 
-        # Insert new token data
+        # Check if token exists already
+        cursor.execute("SELECT token_name FROM tokens WHERE token_name = %s", (token_data.get("tokenName"),))
+        existing = cursor.fetchone()
+
+        if existing:
+            print(f" Skipping {token_data.get('tokenName')} - Already in DB.")
+            return
+
+        print(f" Inserting {token_data.get('tokenName')} into DB...")
+
+        # Insert token data
         cursor.execute("""
             INSERT INTO tokens (token_name, symbol, market_cap, pair_created_at, dex_paid_at)
             VALUES (%s, %s, %s, %s, %s)
@@ -162,16 +173,17 @@ def save_token_data(token_data):
         ))
 
         conn.commit()
-        print(f"DEBUG: Successfully saved {token_data.get('tokenName')}")  # Confirm success
+        print(f" Successfully saved {token_data.get('tokenName')} to the database.")
 
     except Exception as e:
-        print(f"ERROR: Failed to save token - {e}")  # Print SQL errors
+        print(f" ERROR: Failed to save token to DB - {e}")
 
     finally:
         if cursor:
             cursor.close()
         if conn:
-            conn.close()  # Ensures DB connection is always closed
+            conn.close()
+
 
 
 def track_price_changes(token_address, token_name, duration=6, interval=1):
@@ -229,39 +241,47 @@ def inspect_token_profiles(token_profiles):
 
         if token_address not in already_paid_dex_tokens:
             paid, dex_paid_details = is_dex_paid(chain_id, token_address)
+        else:
+            paid, dex_paid_details = False, None  # Ensure paid is always defined
 
-            if paid:
-                print(f" DEBUG: {token_address} is DEX PAID!")  # ADDED
-                already_paid_dex_tokens[token_address] = datetime.now()
+        if paid:
+            print(f"  {token_address} is DEX PAID!")
 
-                pairs = get_token_pairs(chain_id, token_address)
-                if not pairs:
-                    print(f" DEBUG: No pairs found for {token_address}")
-                    continue
-                
-                pair_data = pairs[0]
+            # Add token to the cache
+            already_paid_dex_tokens[token_address] = datetime.now()
 
-                # Convert timestamps
-                pair_created_at = datetime.utcfromtimestamp(int(pair_data.get("pairCreatedAt", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if pair_data.get("pairCreatedAt") else None
-                dex_paid_at = datetime.utcfromtimestamp(int(dex_paid_details.get("paymentTimestamp", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if dex_paid_details and dex_paid_details.get("paymentTimestamp") else None
-                
-                token_name = pair_data.get("baseToken", {}).get("name")
-                market_cap = pair_data.get("marketCap", 0)
+            # ⏳ Small delay to allow pairs to appear
+            time.sleep(3)  # Wait 3 seconds
 
-                print(f"DEBUG: Token Name: {token_name}, Market Cap: {market_cap}, Pair Created: {pair_created_at}, Dex Paid: {dex_paid_at}")
+            pairs = get_token_pairs(chain_id, token_address)
+            if not pairs:
+                print(f"  No pairs found for {token_address}, skipping database save.")
+                continue  # ✅ Use continue instead of return
 
-                save_token_data({
-                    "tokenName": token_name,
-                    "tokenSymbol": pair_data.get("baseToken", {}).get("symbol"),
-                    "marketCap": market_cap,
-                    "pairCreatedAt": pair_created_at,
-                    "dexPaidAt": dex_paid_at
-                })
+            pair_data = pairs[0]  # ✅ Correctly placed outside if block
 
-                threading.Thread(target=track_price_changes, args=(token_address, token_name), daemon=True).start()
-                
-                dex_paid_sniped += 1
-                latest_dex_paid_time = datetime.now()
+            # Convert timestamps
+            pair_created_at = datetime.utcfromtimestamp(int(pair_data.get("pairCreatedAt", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if pair_data.get("pairCreatedAt") else None
+            dex_paid_at = datetime.utcfromtimestamp(int(dex_paid_details.get("paymentTimestamp", 0)) / 1000).strftime('%Y-%m-%d %H:%M:%S UTC') if dex_paid_details and dex_paid_details.get("paymentTimestamp") else None
+            
+            token_name = pair_data.get("baseToken", {}).get("name")
+            market_cap = pair_data.get("marketCap", 0)
+
+            print(f"DEBUG: Token Name: {token_name}, Market Cap: {market_cap}, Pair Created: {pair_created_at}, Dex Paid: {dex_paid_at}")
+
+            print(f"DEBUG: Calling save_token_data() for {token_name}")
+            save_token_data({
+                "tokenName": token_name,
+                "tokenSymbol": pair_data.get("baseToken", {}).get("symbol"),
+                "marketCap": market_cap,
+                "pairCreatedAt": pair_created_at,
+                "dexPaidAt": dex_paid_at
+            })
+
+            threading.Thread(target=track_price_changes, args=(token_address, token_name), daemon=True).start()
+            
+            dex_paid_sniped += 1
+            latest_dex_paid_time = datetime.now()
 
 
 # Main execution loop
