@@ -29,3 +29,6 @@ Look into the data offered in other APIs - bitQuery.
 Think about how to store historical data
 
 Big one, is the initial "DEX PAID MARKET CAP", actually this? Or is it just first market cap recorded? This needs checking, and if incrrect, it needs fixing.
+
+
+check that the bot is tracking changes through the right api end points (speed things up), searching for token--
