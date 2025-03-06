@@ -1,59 +1,66 @@
-# Solana-Bot
+# GitHub Project Description
 
-# **Project in progress - will clean up soon... :) **
+## **Solana Alpha Discovery AI: Predictive Analytics for Low Market Cap Tokens**
 
- Known Issues
-Rate Limit Exceeded:
+**Solana Alpha Discovery AI** is an academic research-driven initiative dedicated to identifying alpha opportunities within low market cap tokens on the Solana blockchain. Utilising advanced machine learning models, quantitative finance, and sophisticated blockchain analytics, the project delivers actionable insights and predictive market signals to enhance strategic decision-making in cryptocurrency trading.
 
-API requests exceed the limit when left running for too long.
-🔧 Fix: Implement request throttling (API limit is ~300/min, but check the docs).
+## **Project Overview**
+
+Cryptocurrency markets, particularly on fast-moving blockchains like Solana, frequently present hidden opportunities in low market cap tokens. These opportunities are subtle and often escape traditional analytical methods. This project is designed to identify and forecast these opportunities, providing early signals and predictive insights through rigorous academic research and advanced quantitative methods.
+
+## **Core Methodologies**
+
+### **1. Blockchain Data Extraction & On-Chain Analysis**
+- **Real-time Data Mining:** Utilisation of Solana blockchain APIs for immediate and historical data extraction.
+- **Liquidity Analysis:** Tracking token liquidity and DEX activity to spot early-stage trading signals.
+- **Whale and Smart Money Movements:** Monitoring significant transaction volumes to predict token performance shifts.
+
+## **Techniques & Methods:**
+
+- Blockchain data extraction via Solana-specific APIs
+- Wallet clustering analysis for insider trading signals
+- Liquidity and transaction pattern recognition
+
+## **2. Predictive Modelling & Alpha Generation**
+
+Developing predictive models to anticipate token performance, evaluating both short-term opportunities and potential long-term growth based on robust quantitative analyses.
+
+- Advanced time-series forecasting (LSTM, Prophet, ARIMA)
+- Bayesian probabilistic models predicting potential price highs
+- Anomaly detection to flag abnormal trading volumes and activities
+- Ensemble learning methods for reliable prediction accuracy
+
+## **Trading Intelligence Dashboard & API**
+
+- Real-time interactive dashboard providing immediate insights into token analytics
+- Automated alerts highlighting actionable alpha signals
+- Quantitative scoring of tokens based on risk factors and market viability
+
+## **Data Engineering & Infrastructure**
+
+- Optimized SQL databases for high-performance data storage and analytics
+- Structured data pipelines supporting real-time and historical analysis
+- Efficient and scalable data querying and integration workflows
+
+## **Academic-Quality Documentation**
+
+- Comprehensive, reproducible, and academically rigorous documentation
+- Clearly structured codebase for transparency and future scalability
+- Regular analytical performance updates and risk assessments
+
+## **Project Objectives**
+
+- Identify actionable trading opportunities in low market cap Solana tokens through advanced predictive analytics
+- Continuously refine predictive models with new data streams
+- Provide quantitative and qualitative insights into market opportunities and risk dynamics
+
+## **Technologies & Tools Used**
+
+- Python (Data Analysis, Machine Learning)
+- SQL database infrastructure
+- Advanced machine learning frameworks (LSTM, ARIMA, Prophet)
+- Solana blockchain API for on-chain data
+
+This project combines cutting-edge data science, machine learning, and quantitative finance to empower informed, strategic trading decisions on the Solana blockchain.
 
 
-Database Optimization Needed:
-
-Queries could slow down as more tokens are stored.
-🔧 Fix: Index critical columns (contract_address, market_cap) for faster lookups.
-
-
-- 
-
-Get new metrics and parameters:
-
-Examples:
-- volume
-- TXNs
-- specific metrics after a certain time(e.g. metrics 5 mins, 10 mins, 20 mins, 30 mins, 45 mins, 1 hour, 1hour 15 mins, 1hour 30 mins, 2 hours, after dex is paid.
-- Save data on if boosts are paid (not a key metric but worth noting)
-- look into other metrics too.
-
-Look into the data offered in other APIs - bitQuery.
-
-Think about how to store historical data
-
-Big one, is the initial "DEX PAID MARKET CAP", actually this? Or is it just first market cap recorded? This needs checking, and if incrrect, it needs fixing.
-**I can confirm that it isnt saving the dex paid market cap, it is saving the market cap of the token when first seen. We will need to use a differnt api end point to get the correct dex paid MC.
-
-
-check that the bot is tracking changes through the right api end points (speed things up), searching for token-- i dont think this i soptimised. A lot of time a requests wasted. I think we could use a separate bot to track changes?? Uses CA from data base to track changes. Only tracks coins for up to 2-3 hours after dec is paid
-
-Add an api which can add the price of SOL at the time dex paid
-
-Need to add a filter for minimum MC
-
-The bots output is only useful for a few minutes before it stops producing good output (just checks tokens, just isnt updating saved ones, nor detecting new ones). Needs looking into.
-
-
-
-Second Bot (autonomous)
-
-this bot will do a lot more. Live trading, ambiguious patterns.
-Will have to do a lot fo research into this before buidling it
-Will take advantages of the market micro strutures of dex paid tokens ( this hasnt been done before). These will be discovered when modelling using the data collected by the first bot. (Dissertation project)
-
-Metrics: 
-- will use performance metrics such as RSI
-- Will take into account market sentiment
-- will need data by the micro second.
-
-Custom sniper bot will be set up to use at this point.
-- 
