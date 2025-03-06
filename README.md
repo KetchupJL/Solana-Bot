@@ -1,6 +1,6 @@
 # Solana-Bot
 
-
+# **Project in progress - will clean up soon... :) **
 
  Known Issues
 Rate Limit Exceeded:
