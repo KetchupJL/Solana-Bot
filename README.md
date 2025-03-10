@@ -1,4 +1,4 @@
-# GitHub Project Description
+# WIP - Majority of code is private
 
 ## **Solana Alpha Discovery AI: Predictive Analytics for Low Market Cap Tokens**
 
